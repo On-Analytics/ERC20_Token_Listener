@@ -55,17 +55,45 @@ alchemy.ws.on('block', async (blockNumber) => {
           blockchain: "ethereum"
         };
         console.log('New ERC20 token detected:', tokenData);
-        // Store in Supabase
-        try {
-          const { error } = await supabase.from('erc20_tokens').insert([tokenData]);
-          if (error) {
-            console.error('Supabase insert error:', error);
-          } else {
-            console.log('Saved to Supabase.');
+
+        // --- Fraud Detection Integration ---
+        const { spawn } = require('child_process');
+        const python = spawn('python', ['risk_assessment_bridge.py']);
+        let riskResult = '';
+        let riskError = '';
+        python.stdin.write(JSON.stringify(tokenData));
+        python.stdin.end();
+        python.stdout.on('data', (data) => {
+          riskResult += data.toString();
+        });
+        python.stderr.on('data', (data) => {
+          riskError += data.toString();
+        });
+        python.on('close', async (code) => {
+          if (riskError) {
+            console.error('Python risk assessment error:', riskError);
           }
-        } catch (dbErr) {
-          console.error('Supabase insert exception:', dbErr);
-        }
+          let riskAssessment = null;
+          try {
+            riskAssessment = JSON.parse(riskResult);
+            console.log('Risk Assessment:', riskAssessment);
+          } catch (err) {
+            console.error('Failed to parse risk assessment:', err, riskResult);
+          }
+
+          // Store in Supabase with risk assessment
+          try {
+            const insertData = riskAssessment ? { ...tokenData, risk_score: riskAssessment.risk_score, is_suspicious: riskAssessment.is_suspicious, risk_indicators: JSON.stringify(riskAssessment.indicators), risk_details: JSON.stringify(riskAssessment.details) } : tokenData;
+            const { error } = await supabase.from('erc20_tokens').insert([insertData]);
+            if (error) {
+              console.error('Supabase insert error:', error);
+            } else {
+              console.log('Saved to Supabase.');
+            }
+          } catch (dbErr) {
+            console.error('Supabase insert exception:', dbErr);
+          }
+        });
       } catch (e) {
         // Not an ERC20 or missing functions
       }
