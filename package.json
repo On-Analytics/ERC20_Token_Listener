@@ -1,0 +1,15 @@
+{
+  "name": "erc20-token-listener",
+  "version": "1.0.0",
+  "description": "Real-time ERC20 token creation listener for Ethereum mainnet using Alchemy SDK and Supabase.",
+  "main": "listener.js",
+  "scripts": {
+    "start": "node listener.js"
+  },
+  "dependencies": {
+    "alchemy-sdk": "^2.7.0",
+    "ethers": "^6.8.1",
+    "@supabase/supabase-js": "^2.39.7",
+    "dotenv": "^16.3.1"
+  }
+}

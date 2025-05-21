@@ -1,0 +1,82 @@
+
+require('dotenv').config();
+const { Alchemy, Network } = require('alchemy-sdk');
+const { ethers } = require('ethers');
+const { createClient } = require('@supabase/supabase-js');
+
+// Initialize Supabase client
+const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_KEY);
+
+const settings = {
+  apiKey: process.env.ALCHEMY_API_KEY,
+  network: Network.ETH_MAINNET,
+};
+const alchemy = new Alchemy(settings);
+
+const ERC20_ABI = [
+  "function name() view returns (string)",
+  "function symbol() view returns (string)",
+  "function decimals() view returns (uint8)",
+  "function totalSupply() view returns (uint256)"
+];
+
+console.log('Listening for new contract deployments using Alchemy SDK...');
+
+alchemy.ws.on('block', async (blockNumber) => {
+  try {
+    const block = await alchemy.core.getBlockWithTransactions(blockNumber);
+    if (!block || !block.transactions) return;
+
+    for (const tx of block.transactions) {
+      if (!tx.creates) continue;
+      const contractAddress = tx.creates;
+      // Use ethers with Alchemy's provider for contract calls
+      const contract = new ethers.Contract(contractAddress, ERC20_ABI, alchemy.core); 
+      try {
+        // Try calling ERC20 functions to verify it's an ERC20
+        const [name, symbol, decimals] = await Promise.all([
+          contract.name(),
+          contract.symbol(),
+          contract.decimals()
+        ]);
+        const creatorAddress = tx.from;
+        const createdBlockTimestamp = block.timestamp;
+        // Convert UNIX timestamp to ISO 8601 string for datetime storage
+        const createdBlockDatetime = new Date(createdBlockTimestamp * 1000).toISOString();
+        // Convert decimals to Number in case it's a BigInt
+        const safeDecimals = typeof decimals === 'bigint' ? Number(decimals) : decimals;
+        const tokenData = {
+          contract_address: contractAddress,
+          creator_address: creatorAddress,
+          created_block_timestamp: createdBlockDatetime,
+          name,
+          symbol,
+          decimals: safeDecimals,
+          blockchain: "ethereum"
+        };
+        console.log('New ERC20 token detected:', tokenData);
+        // Store in Supabase
+        try {
+          const { error } = await supabase.from('erc20_tokens').insert([tokenData]);
+          if (error) {
+            console.error('Supabase insert error:', error);
+          } else {
+            console.log('Saved to Supabase.');
+          }
+        } catch (dbErr) {
+          console.error('Supabase insert exception:', dbErr);
+        }
+      } catch (e) {
+        // Not an ERC20 or missing functions
+      }
+    }
+  } catch (err) {
+    console.error('Error processing block:', err);
+  }
+});
+
+process.on('SIGINT', () => {
+  console.log('Shutting down listener...');
+  alchemy.ws.destroy();
+  process.exit();
+});
