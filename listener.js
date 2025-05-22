@@ -7,11 +7,27 @@ const { createClient } = require('@supabase/supabase-js');
 // Initialize Supabase client
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_KEY);
 
-const settings = {
-  apiKey: process.env.ALCHEMY_API_KEY,
-  network: Network.ETH_MAINNET,
-};
-const alchemy = new Alchemy(settings);
+const NETWORKS = [
+  {
+    name: 'ethereum',
+    settings: {
+      apiKey: process.env.ALCHEMY_API_KEY,
+      network: Network.ETH_MAINNET,
+    }
+  },
+  {
+    name: 'base',
+    settings: {
+      apiKey: process.env.BASE_ALCHEMY_API_KEY,
+      network: Network.BASE_MAINNET,
+    }
+  }
+];
+
+const alchemyInstances = NETWORKS.map(n => ({
+  name: n.name,
+  alchemy: new Alchemy(n.settings)
+}));
 
 const ERC20_ABI = [
   "function name() view returns (string)",
@@ -20,9 +36,10 @@ const ERC20_ABI = [
   "function totalSupply() view returns (uint256)"
 ];
 
-console.log('Listening for new contract deployments using Alchemy SDK...');
+console.log('Listening for new contract deployments on Ethereum and Base using Alchemy SDK...');
 
-alchemy.ws.on('block', async (blockNumber) => {
+for (const { name: chainName, alchemy } of alchemyInstances) {
+  alchemy.ws.on('block', async (blockNumber) => {
   try {
     const block = await alchemy.core.getBlockWithTransactions(blockNumber);
     if (!block || !block.transactions) return;
@@ -52,7 +69,7 @@ alchemy.ws.on('block', async (blockNumber) => {
           name,
           symbol,
           decimals: safeDecimals,
-          blockchain: "ethereum"
+          blockchain: chainName
         };
         console.log('New ERC20 token detected:', tokenData);
 
@@ -83,7 +100,14 @@ alchemy.ws.on('block', async (blockNumber) => {
 
           // Store in Supabase with risk assessment
           try {
-            const insertData = riskAssessment ? { ...tokenData, risk_score: riskAssessment.risk_score, is_suspicious: riskAssessment.is_suspicious, risk_indicators: JSON.stringify(riskAssessment.indicators), risk_details: JSON.stringify(riskAssessment.details) } : tokenData;
+            const insertData = riskAssessment ? {
+              ...tokenData,
+              risk_score: riskAssessment.risk_score,
+              is_suspicious: riskAssessment.is_suspicious,
+              risk_indicators: JSON.stringify(riskAssessment.indicators),
+              risk_details: JSON.stringify(riskAssessment.details),
+              tag_1: riskAssessment.is_suspicious ? 'Phishing' : null
+            } : tokenData;
             const { error } = await supabase.from('erc20_tokens').insert([insertData]);
             if (error) {
               console.error('Supabase insert error:', error);
@@ -102,9 +126,14 @@ alchemy.ws.on('block', async (blockNumber) => {
     console.error('Error processing block:', err);
   }
 });
+}
 
 process.on('SIGINT', () => {
-  console.log('Shutting down listener...');
-  alchemy.ws.destroy();
+  console.log('Shutting down listeners...');
+  for (const { alchemy } of alchemyInstances) {
+    if (alchemy.ws && typeof alchemy.ws.close === 'function') {
+      alchemy.ws.close();
+    }
+  }
   process.exit();
 });
