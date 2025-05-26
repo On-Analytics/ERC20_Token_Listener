@@ -1,4 +1,3 @@
-
 require('dotenv').config();
 const { Alchemy, Network } = require('alchemy-sdk');
 const { ethers } = require('ethers');
@@ -18,8 +17,22 @@ const NETWORKS = [
   {
     name: 'base',
     settings: {
-      apiKey: process.env.BASE_ALCHEMY_API_KEY,
+      apiKey: process.env.ALCHEMY_API_KEY,
       network: Network.BASE_MAINNET,
+    }
+  },
+  {
+    name: 'polygon',
+    settings: {
+      apiKey: process.env.ALCHEMY_API_KEY,
+      network: Network.MATIC_MAINNET,
+    }
+  },
+  {
+    name: 'arbitrum',
+    settings: {
+      apiKey: process.env.ALCHEMY_API_KEY,
+      network: Network.ARB_MAINNET,
     }
   }
 ];
@@ -36,9 +49,36 @@ const ERC20_ABI = [
   "function totalSupply() view returns (uint256)"
 ];
 
-console.log('Listening for new contract deployments on Ethereum and Base using Alchemy SDK...');
+// Validate network configurations on startup
+async function validateNetworkConfigs() {
+  console.log('\n=== Validating Network Configurations ===');
+  for (const { name: chainName, alchemy } of alchemyInstances) {
+    try {
+      const network = await alchemy.core.getNetwork();
+      const latestBlock = await alchemy.core.getBlockNumber();
+      console.log(`${chainName.toUpperCase()}:`);
+      console.log(`  - Network ID: ${network.chainId}`);
+      console.log(`  - Network Name: ${network.name}`);
+      console.log(`  - Latest Block: ${latestBlock}`);
+      console.log(`  - API Key (first 10 chars): ${alchemy.config.apiKey?.substr(0, 10)}...`);
+    } catch (error) {
+      console.error(`❌ Failed to validate ${chainName} network:`, error.message);
+    }
+  }
+  console.log('=== Validation Complete ===\n');
+}
 
+validateNetworkConfigs();
+
+console.log('Listening for new contract deployments on Ethereum, Base, and Polygon using Alchemy SDK...');
+
+// Track processed contract addresses per network
+const processedContracts = {};
+// Each network's listener is fully independent; only processes tokens detected on its own chain.
 for (const { name: chainName, alchemy } of alchemyInstances) {
+  if (!processedContracts[chainName]) processedContracts[chainName] = new Set();
+
+  // Listen for new blocks on this specific network only
   alchemy.ws.on('block', async (blockNumber) => {
   try {
     const block = await alchemy.core.getBlockWithTransactions(blockNumber);
@@ -47,6 +87,9 @@ for (const { name: chainName, alchemy } of alchemyInstances) {
     for (const tx of block.transactions) {
       if (!tx.creates) continue;
       const contractAddress = tx.creates;
+      // Prevent duplicate processing for this network
+      if (processedContracts[chainName].has(contractAddress)) continue;
+      processedContracts[chainName].add(contractAddress);
       // Use ethers with Alchemy's provider for contract calls
       const contract = new ethers.Contract(contractAddress, ERC20_ABI, alchemy.core); 
       try {
@@ -62,6 +105,7 @@ for (const { name: chainName, alchemy } of alchemyInstances) {
         const createdBlockDatetime = new Date(createdBlockTimestamp * 1000).toISOString();
         // Convert decimals to Number in case it's a BigInt
         const safeDecimals = typeof decimals === 'bigint' ? Number(decimals) : decimals;
+        // Each network only processes its own tokens. No cross-chain searching or processing.
         const tokenData = {
           contract_address: contractAddress,
           creator_address: creatorAddress,
@@ -78,7 +122,7 @@ for (const { name: chainName, alchemy } of alchemyInstances) {
         const python = spawn('python', ['risk_assessment_bridge.py']);
         let riskResult = '';
         let riskError = '';
-        python.stdin.write(JSON.stringify(tokenData));
+        python.stdin.write(JSON.stringify([tokenData])); // Wrap in array for Python
         python.stdin.end();
         python.stdout.on('data', (data) => {
           riskResult += data.toString();
@@ -87,28 +131,59 @@ for (const { name: chainName, alchemy } of alchemyInstances) {
           riskError += data.toString();
         });
         python.on('close', async (code) => {
+          // Log stderr output but don't treat it as an error
+          // Our Python script now sends informational logs to stderr
           if (riskError) {
-            console.error('Python risk assessment error:', riskError);
+            console.log('Python stderr output:', riskError);
           }
+          
           let riskAssessment = null;
           try {
-            riskAssessment = JSON.parse(riskResult);
-            console.log('Risk Assessment:', riskAssessment);
+            // Always try to parse if we have a non-empty result
+            // The actual errors would cause the Python script to exit with non-zero code
+            if (riskResult && riskResult.trim()) {
+              riskAssessment = JSON.parse(riskResult);
+              console.log('Risk Assessment:', riskAssessment);
+            } else if (code !== 0) {
+              // Only skip parsing if the Python script actually failed (non-zero exit code)
+              console.log('Skipping risk assessment parsing due to Python error (exit code:', code, ')');
+            }
           } catch (err) {
             console.error('Failed to parse risk assessment:', err, riskResult);
           }
 
           // Store in Supabase with risk assessment
           try {
-            const insertData = riskAssessment ? {
-              ...tokenData,
-              risk_score: riskAssessment.risk_score,
-              is_suspicious: riskAssessment.is_suspicious,
-              risk_indicators: JSON.stringify(riskAssessment.indicators),
-              risk_details: JSON.stringify(riskAssessment.details),
-              tag_1: riskAssessment.is_suspicious ? 'Phishing' : null
-            } : tokenData;
-            const { error } = await supabase.from('erc20_tokens').insert([insertData]);
+            // Always save the token data, with risk assessment if available
+            let insertData = { ...tokenData };
+            
+            // Add risk assessment data if available
+            if (riskAssessment && Array.isArray(riskAssessment) && riskAssessment.length > 0) {
+              // The Python script returns an array, so we need to get the first item
+              const assessment = riskAssessment[0];
+              
+              // Map all the fields from the Python risk assessment to the Supabase schema
+              insertData = {
+                ...insertData,
+                // Using only columns that exist in the table schema
+                risk_category: assessment.risk_category || 'unknown',
+                fraud_type: assessment.fraud_type || 'unknown',
+                // Store all details in the detection_details column
+                detection_details: JSON.stringify({
+                  phishing_indicators: assessment.phishing_indicators || [],
+                  urls_found: assessment.urls_found || [],
+                  money_amounts: assessment.money_amounts || [],
+                  details: assessment.details || {}
+                })
+              };
+              
+              console.log(`Preparing to save with fraud_type=${assessment.fraud_type}, risk_category=${assessment.risk_category}`);
+            }
+            
+            // Upsert the token data into Supabase using the unique constraint
+            const { error } = await supabase.from('erc20_tokens').upsert([insertData], {
+              onConflict: 'contract_address,blockchain'
+            });
             if (error) {
               console.error('Supabase insert error:', error);
             } else {

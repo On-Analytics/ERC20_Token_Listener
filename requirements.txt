@@ -1,2 +1,6 @@
 urlextract
+pandas
+python-Levenshtein
+supabase
+python-dotenv
 tldextract
